@@ -145,9 +145,7 @@ pub struct Recovery {
     hystart: hystart::Hystart,
 
     // Pacing.
-    pacing_rate: u64,
-
-    last_packet_scheduled_time: Instant,
+    pub pacer: pacer::Pacer,
 
     // RFC6937 PRR.
     prr: prr::PRR,
@@ -162,6 +160,9 @@ pub struct Recovery {
 
 impl Recovery {
     pub fn new(config: &Config) -> Self {
+        let initial_congestion_window =
+            config.max_send_udp_payload_size * INITIAL_WINDOW_PACKETS;
+
         Recovery {
             loss_detection_timer: None,
 
@@ -204,8 +205,7 @@ impl Recovery {
 
             in_flight_count: [0; packet::EPOCH_COUNT],
 
-            congestion_window: config.max_send_udp_payload_size *
-                INITIAL_WINDOW_PACKETS,
+            congestion_window: initial_congestion_window,
 
             pkt_thresh: INITIAL_PACKET_THRESHOLD,
 
@@ -237,14 +237,11 @@ impl Recovery {
 
             hystart: hystart::Hystart::new(config.hystart),
 
-            pacing_rate: 0,
-
-            last_packet_scheduled_time: Instant::now(),
+            pacer: pacer::Pacer::new(initial_congestion_window, 0),
 
             prr: prr::PRR::default(),
 
-            send_quantum: config.max_send_udp_payload_size *
-                INITIAL_WINDOW_PACKETS,
+            send_quantum: initial_congestion_window,
 
             #[cfg(feature = "qlog")]
             qlog_metrics: QlogMetrics::default(),
@@ -301,7 +298,7 @@ impl Recovery {
             if let Some(srtt) = self.smoothed_rtt {
                 let rate = PACING_MULTIPLIER * self.congestion_window as f64 /
                     srtt.as_secs_f64();
-                self.set_pacing_rate(rate as u64);
+                self.set_pacing_rate(rate as u64, now);
             }
         }
 
@@ -319,14 +316,12 @@ impl Recovery {
         (self.cc_ops.on_packet_sent)(self, sent_bytes, now);
     }
 
-    pub fn set_pacing_rate(&mut self, rate: u64) {
-        if rate != 0 {
-            self.pacing_rate = rate;
-        }
+    pub fn set_pacing_rate(&mut self, rate: u64, now: Instant) {
+        self.pacer.update(self.send_quantum, rate, now);
     }
 
     pub fn get_packet_send_time(&self) -> Instant {
-        self.last_packet_scheduled_time
+        self.pacer.next_time()
     }
 
     fn schedule_next_packet(
@@ -334,24 +329,17 @@ impl Recovery {
     ) {
         // Don't pace in any of these cases:
         //   * Packet epoch is not EPOCH_APPLICATION.
-        //   * Packet contains only ACK frames.
-        //   * The start of the connection.
-        if epoch != packet::EPOCH_APPLICATION ||
-            packet_size == 0 ||
-            self.bytes_sent <= self.congestion_window ||
-            self.pacing_rate == 0
+        //   * Packet contains no data.
+        //   * The start of the connection (within initcwnd).
+        let sent_bytes = if epoch != packet::EPOCH_APPLICATION ||
+            self.bytes_sent < self.max_datagram_size * INITIAL_WINDOW_PACKETS
         {
-            self.last_packet_scheduled_time =
-                cmp::max(self.last_packet_scheduled_time, now);
+            0
+        } else {
+            packet_size
+        };
 
-            return;
-        }
-
-        let interval = packet_size as f64 / self.pacing_rate as f64;
-        let interval = Duration::from_secs_f64(interval);
-        let next_schedule_time = self.last_packet_scheduled_time + interval;
-
-        self.last_packet_scheduled_time = cmp::max(now, next_schedule_time);
+        self.pacer.send(sent_bytes, now);
     }
 
     pub fn on_ack_received(
@@ -1073,12 +1061,7 @@ impl std::fmt::Debug for Recovery {
             self.congestion_recovery_start_time
         )?;
         write!(f, "{:?} ", self.delivery_rate)?;
-        write!(f, "pacing_rate={:?} ", self.pacing_rate)?;
-        write!(
-            f,
-            "last_packet_scheduled_time={:?} ",
-            self.last_packet_scheduled_time
-        )?;
+        write!(f, "pacer={:?} ", self.pacer)?;
 
         if self.hystart.enabled() {
             write!(f, "hystart={:?} ", self.hystart)?;
@@ -1902,7 +1885,7 @@ mod tests {
             time_sent: now,
             time_acked: None,
             time_lost: None,
-            size: 6500,
+            size: 6000,
             ack_eliciting: true,
             in_flight: true,
             delivered: 0,
@@ -1921,10 +1904,10 @@ mod tests {
         );
 
         assert_eq!(r.sent[packet::EPOCH_APPLICATION].len(), 1);
-        assert_eq!(r.bytes_in_flight, 6500);
+        assert_eq!(r.bytes_in_flight, 6000);
 
         // First packet will be sent out immidiately.
-        assert_eq!(r.pacing_rate, 0);
+        assert_eq!(r.pacer.rate(), 0);
         assert_eq!(r.get_packet_send_time(), now);
 
         // Wait 50ms for ACK.
@@ -1956,7 +1939,7 @@ mod tests {
             time_sent: now,
             time_acked: None,
             time_lost: None,
-            size: 6500,
+            size: 6000,
             ack_eliciting: true,
             in_flight: true,
             delivered: 0,
@@ -1975,7 +1958,7 @@ mod tests {
         );
 
         assert_eq!(r.sent[packet::EPOCH_APPLICATION].len(), 1);
-        assert_eq!(r.bytes_in_flight, 6500);
+        assert_eq!(r.bytes_in_flight, 6000);
 
         // Pacing is not done during intial phase of connection.
         assert_eq!(r.get_packet_send_time(), now);
@@ -1987,7 +1970,7 @@ mod tests {
             time_sent: now,
             time_acked: None,
             time_lost: None,
-            size: 6500,
+            size: 12000,
             ack_eliciting: true,
             in_flight: true,
             delivered: 0,
@@ -2006,16 +1989,17 @@ mod tests {
         );
 
         assert_eq!(r.sent[packet::EPOCH_APPLICATION].len(), 2);
-        assert_eq!(r.bytes_in_flight, 13000);
+        assert_eq!(r.bytes_in_flight, 18000);
         assert_eq!(r.smoothed_rtt.unwrap(), Duration::from_millis(50));
 
         // We pace this outgoing packet. as all conditions for pacing
         // are passed.
         let pacing_rate = (12000.0 * PACING_MULTIPLIER / 0.05) as u64;
-        assert_eq!(r.pacing_rate, pacing_rate);
+        assert_eq!(r.pacer.rate(), pacing_rate);
+
         assert_eq!(
             r.get_packet_send_time(),
-            now + Duration::from_secs_f64(6500.0 / pacing_rate as f64)
+            now + Duration::from_secs_f64(12000.0 / pacing_rate as f64)
         );
     }
 }
@@ -2023,5 +2007,6 @@ mod tests {
 mod cubic;
 mod delivery_rate;
 mod hystart;
+mod pacer;
 mod prr;
 mod reno;
